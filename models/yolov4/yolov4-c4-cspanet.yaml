@@ -1,0 +1,63 @@
+# parameters
+nc: 10  # number of classes
+depth_multiple: 1.0  # model depth multiple
+width_multiple: 1.0  # layer channel multiple
+
+# anchors
+anchors:
+# COCO
+#  - [10,13, 16,30, 33,23]  # P3/8
+#  - [30,61, 62,45, 59,119]  # P4/16
+#  - [116,90, 156,198, 373,326]  # P5/32
+
+# BDD100k Gaussian YOLOv3 https://arxiv.org/pdf/1904.04620.pdf
+  - [ 7,10, 14,24, 27,43 ]  # P3/8
+  - [ 32,97, 57,64, 92,109 ]  # P4/16
+  - [ 73,175, 141,178, 144,291 ]  # P5/32
+
+
+# CSPDarknet-53 backbone
+backbone:
+  # [from, number, module, args]
+  [[-1, 1, Conv, [32, 3, 1]],  # 0
+   [-1, 1, Conv, [64, 3, 2]],  # 1-P1/2
+   [-1, 1, Bottleneck, [64]],
+   [-1, 1, Conv, [128, 3, 2]],  # 3-P2/4
+   [-1, 2, C4, [128]],
+   [-1, 1, Conv, [256, 3, 2]],  # 5-P3/8
+   [-1, 8, C4, [256]],
+   [-1, 1, Conv, [512, 3, 2]],  # 7-P4/16
+   [-1, 8, C4, [512]],
+   [-1, 1, Conv, [1024, 3, 2]], # 9-P5/32
+   [-1, 4, C4, [1024]],  # 10
+  ]
+
+# modified from yolov4-cspa.cfg
+head:
+  [[-1, 1, SPPCSP2, [512, [5, 9, 13]]],  # 11 -->
+   [-1, 1, Conv, [256, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+   [8, 1, Conv, [256, 1, 1]],  # conv1x1 backbone P4
+   [[-2, -1], 1, Concat, [1]],  # concat backbone P4  512
+
+   [-1, 2, BottleneckCSP3, [256, False]],  # 16 -->
+   [-1, 1, Conv, [128, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+   [6, 1, Conv, [128, 1, 1]],  # conv1x1 backbone P3
+   [[-2, -1], 1, Concat, [1]],  # concat backbone P3  256
+
+   [-1, 2, BottleneckCSP3, [128, False]], # 21
+   [-1, 1, Conv, [256, 3, 1]], # 22 (P3/8-small)
+
+   [21, 1, Conv, [256, 3, 2]], # down sample
+   [[-1, 16], 1, Concat, [1]],  # concat 16  512
+   [-1, 2, BottleneckCSP3, [256, False]],  # 25
+   [-1, 1, Conv, [512, 3, 1]],  # 26 (P4/16-medium)
+
+   [25, 1, Conv, [512, 3, 2]], # down sample
+   [[-1, 11], 1, Concat, [1]],  # concat 11  1024
+   [-1, 2, BottleneckCSP3, [512, False]],
+   [-1, 1, Conv, [1024, 3, 1]],  # 30 (P5/32-large)
+
+   [[22, 26, 30], 1, Detect, [nc, anchors]],   # Detect(P3, P4, P5)
+  ]
