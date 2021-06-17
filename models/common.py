@@ -393,3 +393,398 @@ class Classify(nn.Module):
     def forward(self, x):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
+
+
+class SPPCSP(nn.Module):
+    # CSP SPP https://github.com/WongKinYiu/CrossStagePartialNetworks
+    def __init__(self, c1, c2, e=0.5, k=(5, 9, 13)):
+        super(SPPCSP, self).__init__()
+        c_ = int(2 * c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = nn.Conv2d(c1, c_, 1, 1, bias=False)
+        self.cv3 = Conv(c_, c_, 3, 1)
+        self.cv4 = Conv(c_, c_, 1, 1)
+        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+        self.cv5 = Conv(4 * c_, c_, 1, 1)
+        self.cv6 = Conv(c_, c_, 3, 1)
+        self.bn = nn.BatchNorm2d(2 * c_)
+        # self.act = Mish()
+        self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.cv7 = Conv(2 * c_, c2, 1, 1)
+
+    def forward(self, x):
+        x1 = self.cv4(self.cv3(self.cv1(x)))
+        y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
+        y2 = self.cv2(x)
+        return self.cv7(self.act(self.bn(torch.cat((y1, y2), dim=1))))
+
+
+class BottleneckCSP2(nn.Module):
+    # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(BottleneckCSP2, self).__init__()
+        c_ = int(c2)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = nn.Conv2d(c_, c_, 1, 1, bias=False)
+        self.cv3 = Conv(2 * c_, c2, 1, 1)
+        self.bn = nn.BatchNorm2d(2 * c_)
+        # self.act = Mish()
+        self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+
+    def forward(self, x):
+        x1 = self.cv1(x)
+        y1 = self.m(x1)
+        y2 = self.cv2(x1)
+        return self.cv3(self.act(self.bn(torch.cat((y1, y2), dim=1))))
+
+
+# CAM
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, c1, reduction=16):
+        super(ChannelAttentionModule, self).__init__()
+        mid_channel = c1 // reduction
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.shared_MLP = nn.Sequential(
+            nn.Linear(in_features=c1, out_features=mid_channel),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(in_features=mid_channel, out_features=c1)
+        )
+        self.act = nn.Sigmoid()
+        # self.act = nn.SiLU()
+
+    def forward(self, x):
+        avgout = self.shared_MLP(self.avg_pool(x).view(x.size(0), -1)).unsqueeze(2).unsqueeze(3)
+        maxout = self.shared_MLP(self.max_pool(x).view(x.size(0), -1)).unsqueeze(2).unsqueeze(3)
+        return self.act(avgout + maxout)
+
+
+# SAM
+class SpatialAttentionModule(nn.Module):
+    def __init__(self):
+        super(SpatialAttentionModule, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3)
+        self.act = nn.Sigmoid()
+        # self.act = nn.SiLU()
+
+    def forward(self, x):
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.act(self.conv2d(out))
+        return out
+
+
+# CBAM
+class CBAM(nn.Module):
+    def __init__(self, c1):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttentionModule(c1)
+        self.spatial_attention = SpatialAttentionModule()
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+
+
+class C3_CBAM(nn.Module):
+    # C3 + CBAM
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(C3_CBAM, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.cbam = CBAM(c_)
+
+    def forward(self, x):
+        x1 = self.m(self.cv1(x))
+        y1 = self.cbam(x1)
+        y2 = self.cv2(x)
+        return self.cv3(torch.cat((y1, y2), dim=1))
+
+
+# Coordinate Attention
+# https://arxiv.org/abs/2103.02907
+# https://github.com/Andrew-Qibin/CoordAttention
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_w * a_h
+
+        return out
+
+
+class C3_CA(nn.Module):
+    # C3 + Coordinate Attention
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(C3_CA, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.coord = CoordAtt(c_, c_)
+
+    def forward(self, x):
+        x1 = self.m(self.cv1(x))
+        y1 = self.coord(x1)
+        y2 = self.cv2(x)
+        return self.cv3(torch.cat((y1, y2), dim=1))
+
+
+# Concat for BiFPN
+class Concat2(nn.Module):
+    def __init__(self, c1, c2):
+        super(Concat2, self).__init__()
+        # self.relu = nn.ReLU()
+        self.w1 = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.w2 = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 0.0001
+        self.conv = nn.Conv2d(c1, c2, kernel_size=1, stride=1, padding=0)
+        self.swish = nn.SiLU()
+
+    def forward(self, x):
+        outs = self._forward(x)
+        return outs
+
+    def _forward(self, x):
+        if len(x) == 2:
+            w = self.w1
+            weight = w / (torch.sum(w, dim=0) + self.epsilon)
+
+            x = self.conv(self.swish(weight[0] * x[0] + weight[1] * x[1]))
+        elif len(x) == 3:
+            w = self.w2
+            weight = w / (torch.sum(w, dim=0) + self.epsilon)
+            x = self.conv(self.swish(weight[0] * x[0] + weight[1] * x[1] + weight[2] * x[2]))
+
+        return x
+
+
+class Bottleneck_CA(nn.Module):
+    # bottleneck with CA
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super(Bottleneck_CA, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.coord = CoordAtt(c2, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.coord(self.cv2(self.cv1(x))) if self.add else self.coord(self.cv2(self.cv1(x)))
+
+
+class C3_Bottle_CA(nn.Module):
+    # C3(Bottle_CA)
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(C3_Bottle_CA, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[Bottleneck_CA(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+
+    def forward(self, x):
+        y1 = self.m(self.cv1(x))
+        y2 = self.cv2(x)
+        return self.cv3(torch.cat((y1, y2), dim=1))
+
+
+class Bottleneck_CBCA(nn.Module):
+    # bottleneck with CBCA
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super(Bottleneck_CBCA, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.attention = CBAM(c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.attention(self.cv2(self.cv1(x))) if self.add else self.attention(self.cv2(self.cv1(x)))
+
+
+class C3_Bottle_CBCA(nn.Module):
+    # (C3_Bottle_CBCA)
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(C3_Bottle_CBCA, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[Bottleneck_CBCA(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+
+    def forward(self, x):
+        y1 = self.m(self.cv1(x))
+        y2 = self.cv2(x)
+        return self.cv3(torch.cat((y1, y2), dim=1))
+
+
+class BottleneckCSP_CBAM(nn.Module):
+    # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(BottleneckCSP_CBAM, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = nn.Conv2d(c1, c_, 1, 1, bias=False)
+        self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
+        self.cv4 = Conv(2 * c_, c2, 1, 1)
+        self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
+        # self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.act = nn.SiLU(inplace=True)
+        self.m = nn.Sequential(*[Bottleneck_CBCA(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+
+    def forward(self, x):
+        y1 = self.cv3(self.m(self.cv1(x)))
+        y2 = self.cv2(x)
+        return self.cv4(self.act(self.bn(torch.cat((y1, y2), dim=1))))
+
+
+class BasicConv(nn.Module):
+
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
+                 bn=True, bias=False):
+        super(BasicConv, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
+        # self.relu = nn.ReLU(inplace=True) if relu else None
+        self.relu = nn.SiLU(inplace=True) if relu else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
+        return x
+
+
+class RFB(nn.Module):
+
+    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, visual=1):
+        super(RFB, self).__init__()
+        self.scale = scale
+        self.out_channels = out_planes
+        inter_planes = in_planes // 8
+        self.branch0 = nn.Sequential(
+            BasicConv(in_planes, 2 * inter_planes, kernel_size=1, stride=stride),
+            BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=visual, dilation=visual,
+                      relu=False)
+        )
+        self.branch1 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, 2 * inter_planes, kernel_size=(3, 3), stride=stride, padding=(1, 1)),
+            BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=visual + 1,
+                      dilation=visual + 1, relu=False)
+        )
+        self.branch2 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, (inter_planes // 2) * 3, kernel_size=3, stride=1, padding=1),
+            BasicConv((inter_planes // 2) * 3, 2 * inter_planes, kernel_size=3, stride=stride, padding=1),
+            BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=2 * visual + 1,
+                      dilation=2 * visual + 1, relu=False)
+        )
+
+        self.ConvLinear = BasicConv(6 * inter_planes, out_planes, kernel_size=1, stride=1, relu=False)
+        self.shortcut = BasicConv(in_planes, out_planes, kernel_size=1, stride=stride, relu=False)
+        # self.relu = nn.ReLU(inplace=False)
+        self.relu = nn.SiLU()
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+
+        out = torch.cat((x0, x1, x2), 1)
+        out = self.ConvLinear(out)
+        short = self.shortcut(x)
+        out = out * self.scale + short
+        out = self.relu(out)
+
+        return out
+
+
+class RFB_s(nn.Module):
+
+    def __init__(self, in_planes, out_planes, stride=1, scale=0.1):
+        super(RFB_s, self).__init__()
+        self.scale = scale
+        self.out_channels = out_planes
+        inter_planes = in_planes // 4
+
+        self.branch0 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, inter_planes, kernel_size=3, stride=1, padding=1, relu=False)
+        )
+        self.branch1 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, inter_planes, kernel_size=(3, 1), stride=1, padding=(1, 0)),
+            BasicConv(inter_planes, inter_planes, kernel_size=3, stride=1, padding=3, dilation=3, relu=False)
+        )
+        self.branch2 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, inter_planes, kernel_size=(1, 3), stride=stride, padding=(0, 1)),
+            BasicConv(inter_planes, inter_planes, kernel_size=3, stride=1, padding=3, dilation=3, relu=False)
+        )
+        self.branch3 = nn.Sequential(
+            BasicConv(in_planes, inter_planes // 2, kernel_size=1, stride=1),
+            BasicConv(inter_planes // 2, (inter_planes // 4) * 3, kernel_size=(1, 3), stride=1, padding=(0, 1)),
+            BasicConv((inter_planes // 4) * 3, inter_planes, kernel_size=(3, 1), stride=stride, padding=(1, 0)),
+            BasicConv(inter_planes, inter_planes, kernel_size=3, stride=1, padding=5, dilation=5, relu=False)
+        )
+
+        self.ConvLinear = BasicConv(4 * inter_planes, out_planes, kernel_size=1, stride=1, relu=False)
+        self.shortcut = BasicConv(in_planes, out_planes, kernel_size=1, stride=stride, relu=False)
+        self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+
+        out = torch.cat((x0, x1, x2, x3), 1)
+        out = self.ConvLinear(out)
+        short = self.shortcut(x)
+        out = out * self.scale + short
+        out = self.relu(out)
+
+        return out

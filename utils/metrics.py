@@ -35,11 +35,16 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
+    # targets_cls 所有目标的类别
     unique_classes = np.unique(target_cls)
     nc = unique_classes.shape[0]  # number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class
+    # 0,1 等差数列 切1000份
     px, py = np.linspace(0, 1, 1000), []  # for plotting
+    # ap (nc, 10)
+    # p (nc, 1000)
+    # r (nc, 1000)
     ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
     for ci, c in enumerate(unique_classes):
         i = pred_cls == c
@@ -53,11 +58,11 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
             fpc = (1 - tp[i]).cumsum(0)
             tpc = tp[i].cumsum(0)
 
-            # Recall
+            # Recall=TP/(TP+FN)  预测的正例中有多少是真实正例
             recall = tpc / (n_l + 1e-16)  # recall curve
             r[ci] = np.interp(-px, -conf[i], recall[:, 0], left=0)  # negative x, xp because xp decreases
 
-            # Precision
+            # Precision=TP/(TP+FP)  真实正例中有多少被挑选出来
             precision = tpc / (tpc + fpc)  # precision curve
             p[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
 
@@ -65,12 +70,16 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
             for j in range(tp.shape[1]):
                 ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
                 if plot and j == 0:
+                    # py
                     py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
 
     # Compute F1 (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + 1e-16)
     if plot:
         plot_pr_curve(px, py, ap, Path(save_dir) / 'PR_curve.png', names)
+        plot_pr_curve_cls7(px, py, ap, Path(save_dir) / 'cls7-PR_curve.png', names)
+        plot_pr_curve_cls6(px, py, ap, Path(save_dir) / 'cls6-PR_curve.png', names)
+
         plot_mc_curve(px, f1, Path(save_dir) / 'F1_curve.png', names, ylabel='F1')
         plot_mc_curve(px, p, Path(save_dir) / 'P_curve.png', names, ylabel='Precision')
         plot_mc_curve(px, r, Path(save_dir) / 'R_curve.png', names, ylabel='Recall')
@@ -198,6 +207,108 @@ def plot_pr_curve(px, py, ap, save_dir='pr_curve.png', names=()):
         ax.plot(px, py, linewidth=1, color='grey')  # plot(recall, precision)
 
     ax.plot(px, py.mean(1), linewidth=3, color='blue', label='all classes %.3f mAP@0.5' % ap[:, 0].mean())
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
+    fig.savefig(Path(save_dir), dpi=250)
+
+
+def plot_pr_curve_cls9(px, py, ap, save_dir='pr_curve.png', names=()):
+    # PR cls9
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
+    # py (1000,nc)
+    py = np.stack(py, axis=1)
+
+    if 0 < len(names) < 21:  # display per-class legend if < 21 classes
+        for i, y in enumerate(py.T):  # py.T (nc, 1000)
+            # names = {0:'person', 1:'rider', 2:'car', ...}
+            # get rid of 9:'train'
+            if names[i] != 'train':
+                ax.plot(px, y, linewidth=1, label=f'{names[i]} {ap[i, 0]:.3f}')  # plot(recall, precision)
+    else:
+        ax.plot(px, py, linewidth=1, color='grey')  # plot(recall, precision)
+
+    py_cls9 = py[:, 0:9]  # (1000,9)
+
+    # (9, 10)
+    ap50_cls9 = []
+    ap50_cls9 += ap[0:9, 0].tolist()
+    ap50_cls9 = np.array(ap50_cls9)
+
+    ax.plot(px, py_cls9.mean(1), linewidth=3, color='blue', label='mAP@0.5 %.3f ' % ap50_cls9.mean())
+    # ax.plot(px, py.mean(1), linewidth=3, color='blue', label='all classes %.3f mAP@0.5' % ap[:, 0].mean())
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
+    fig.savefig(Path(save_dir), dpi=250)
+
+
+def plot_pr_curve_cls7(px, py, ap, save_dir='pr_curve.png', names=()):
+    # PR cls7
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
+    # py (1000,nc)
+    py = np.stack(py, axis=1)
+
+    if 0 < len(names) < 21:  # display per-class legend if < 21 classes
+        for i, y in enumerate(py.T):  # py.T (nc, 1000)
+            # names = {0:'person', 1:'rider', 2:'car', ...}
+            # get rid of 1, 6, 9
+            if names[i] != 'rider' and names[i] != 'motor' and names[i] != 'train':
+                ax.plot(px, y, linewidth=1, label=f'{names[i]} {ap[i, 0]:.3f}')  # plot(recall, precision)
+    else:
+        ax.plot(px, py, linewidth=1, color='grey')  # plot(recall, precision)
+
+    nc0, nc2_5, nc7_8 = py[:, 0:1], py[:, 2:6], py[:, 7:9]
+    py_cls7 = np.hstack((nc0, nc2_5))
+    py_cls7 = np.hstack((py_cls7, nc7_8))  # (1000,7)
+
+    # (7, 10)
+    ap50_cls7 = [ap[0][0]]
+    ap50_cls7 += ap[2:6, 0].tolist()
+    ap50_cls7 += ap[7:9, 0].tolist()
+    ap50_cls7 = np.array(ap50_cls7)
+
+    ax.plot(px, py_cls7.mean(1), linewidth=3, color='blue', label='mAP@0.5 %.3f ' % ap50_cls7.mean())
+    # ax.plot(px, py.mean(1), linewidth=3, color='blue', label='mAP@0.5 %.3f ' % ap[:, 0].mean())
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
+    fig.savefig(Path(save_dir), dpi=250)
+
+
+def plot_pr_curve_cls6(px, py, ap, save_dir='pr_curve.png', names=()):
+    # PR cls7
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
+    # py (1000,nc)
+    py = np.stack(py, axis=1)
+
+    if 0 < len(names) < 21:  # display per-class legend if < 21 classes
+        for i, y in enumerate(py.T):  # py.T (nc, 1000)
+            # names = {0:'person', 1:'rider', 2:'car', ...}
+            # get rid of {1:'rider', 5:'bike', 6:'motor', 9:'train'}
+            if names[i] != 'rider' and names[i] != 'bike' and names[i] != 'motor' and names[i] != 'train':
+                ax.plot(px, y, linewidth=1, label=f'{names[i]} {ap[i, 0]:.3f}')  # plot(recall, precision)
+    else:
+        ax.plot(px, py, linewidth=1, color='grey')  # plot(recall, precision)
+
+    nc0, nc2_4, nc7_8 = py[:, 0:1], py[:, 2:5], py[:, 7:9]
+    py_cls6 = np.hstack((nc0, nc2_4))
+    py_cls6 = np.hstack((py_cls6, nc7_8))  # (1000,6)
+
+    # (6, 10)
+    ap50_cls6 = [ap[0][0]]
+    ap50_cls6 += ap[2:5, 0].tolist()
+    ap50_cls6 += ap[7:9, 0].tolist()
+    ap50_cls6 = np.array(ap50_cls6)
+
+    ax.plot(px, py_cls6.mean(1), linewidth=3, color='blue', label='mAP@0.5 %.3f ' % ap50_cls6.mean())
+    # ax.plot(px, py.mean(1), linewidth=3, color='blue', label='mAP@0.5 %.3f ' % ap[:, 0].mean())
     ax.set_xlabel('Recall')
     ax.set_ylabel('Precision')
     ax.set_xlim(0, 1)

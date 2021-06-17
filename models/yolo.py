@@ -227,7 +227,7 @@ class Model(nn.Module):
         copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
         return m
 
-    def info(self, verbose=False, img_size=640):  # print model information
+    def info(self, verbose=False, img_size=512):  # print model information
         model_info(self, verbose, img_size)
 
 
@@ -247,20 +247,25 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP,
-                 C3, C3TR]:
+        if m in [Conv, GhostConv, Bottleneck, Bottleneck_CA, Bottleneck_CBCA, GhostBottleneck, SPP, DWConv, MixConv2d,
+                 Focus, CrossConv, BottleneckCSP, C3, C3TR, CBAM, C3_CBAM, C3_CA, C3_Bottle_CA, C3_Bottle_CBCA,
+                 BottleneckCSP_CBAM, CoordAtt, SPPCSP, BottleneckCSP2, RFB, RFB_s]:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3TR]:
+            if m in [BottleneckCSP, BottleneckCSP2, BottleneckCSP_CBAM, C3, C3TR, C3_CBAM, C3_CA, C3_Bottle_CA,
+                     C3_Bottle_CBCA]:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum([ch[x] for x in f])
+            # BiFPN
+        elif m is Concat2:
+            c2 = max([ch[x] for x in f])
         elif m is Detect:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
@@ -287,7 +292,20 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
+
+    v4_c3boca = 'yolov4-c3boca.yaml'  # C3 + Bottleneck_CA
+    v4_c3cbam = 'yolov4-c3cbam.yaml'  # C3 + CBAM
+    v4_c3 = 'yolov4-c3.yaml'  # No CA
+    v4_c3boca_bifpn = 'yolov4-c3boca-bifpn.yaml'
+
+    v4_rfb = 'yolov4-c3-rfb.yaml'
+    cs57_075_c3 = 'cs57-0.75-c3.yaml'
+    cs57_075_rfb = 'cs57-0.75-c3-rfb.yaml'
+    cs57_075_rfb_cbam = 'cs57-0.75-c3-rfb-cbam.yaml'
+    cs57_075_rfb_cbcbam = 'cs57-0.75-c3-rfb-cbcbam.yaml'  # bottleneck cbam + c3 cbam
+    cs57_075_rfb_ca = 'cs57-0.75-c3-rfb-ca.yaml'
+
+    parser.add_argument('--cfg', type=str, default=cs57_075_rfb_cbcbam, help='model.yaml')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     opt = parser.parse_args()
     opt.cfg = check_file(opt.cfg)  # check file
